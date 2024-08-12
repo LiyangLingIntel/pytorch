@@ -84,8 +84,69 @@ mm_template = TritonTemplate(
 """,
 )
 
-aten_mm = ExternKernelChoice(torch.mm, "at::mm_out")
+mm_triton_blockptr = TritonTemplate(
+    name="mm_blockptr",
+    grid=mm_grid,
+    mask = (idx_m < M) & (idx_n < N)
+    source=r"""
+{{def_kernel("A", "B")}}
+    M = {{size("A", 0)}}
+    N = {{size("B", 1)}}
+    K = {{size("A", 1)}}
+    if M * N == 0:
+        # early exit due to zero-size input(s)
+        return
+    stride_am = {{stride("A", 0)}}
+    stride_ak = {{stride("A", 1)}}
+    stride_bk = {{stride("B", 0)}}
+    stride_bn = {{stride("B", 1)}}
 
+    # based on triton.ops.matmul
+    pid = tl.program_id(0)
+    // grid_m = (M + BLOCK_M - 1) // BLOCK_M
+    // grid_n = (N + BLOCK_N - 1) // BLOCK_N
+
+    // # re-order program ID for better L2 performance
+    // width = GROUP_M * grid_n
+    // group_id = pid // width
+    // group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    // pid_m = group_id * GROUP_M + (pid % group_size)
+    // pid_n = (pid % width) // (group_size)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(stride_am, stride_ak),
+                                    offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K),
+                                    order=(1, 0))
+    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K, N), strides=(stride_bk, stride_bn),
+                                    offsets=(0, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N),
+                                    order=(1, 0))
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_block_ptr, boundary_check=(0, 1))
+        b = tl.load(b_block_ptr, boundary_check=(0, 1))
+        accumulator += tl.dot(a, b)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))
+
+    c = accumulator.to(tl.float32)
+
+    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(stride_cm, stride_cn),
+                                    offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+                                    block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))
+
+    tl.store(c_block_ptr, c, boundary_check=(0, 1))
+""", debug=True,
+)
+
+aten_mm = ExternKernelChoice(torch.mm, "at::mm_out")
 
 aten_addmm = ExternKernelChoice(torch.addmm, "at::addmm_out")
 
@@ -115,15 +176,23 @@ def tuned_mm(mat1, mat2, *, layout=None):
     m, n, k, layout, mat1, mat2 = mm_args(mat1, mat2, layout=layout)
 
     # options to tune from
-    choices = [aten_mm.bind((mat1, mat2), layout)] if use_aten_gemm_kernels() else []
-    if m * n != 0 and use_triton_template(layout):
+    # choices = [aten_mm.bind((mat1, mat2), layout)] if use_aten_gemm_kernels() else []
+    choices = []
+    # if m * n != 0 and use_triton_template(layout):
+    if m * n != 0 and True:
         for config in mm_configs(m, n, k):
-            mm_template.maybe_append_choice(
+            mm_triton_blockptr.maybe_append_choice(
                 choices,
                 (mat1, mat2),
                 layout,
                 **mm_options(config, k, layout),
             )
+            # mm_template.maybe_append_choice(
+            #     choices,
+            #     (mat1, mat2),
+            #     layout,
+            #     **mm_options(config, k, layout),
+            # )
 
     return autotune_select_algorithm("mm", choices, [mat1, mat2], layout)
 

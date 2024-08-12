@@ -22,7 +22,7 @@ def filtered_configs(
     m: int,
     n: int,
     k: int,
-    configs: List[Tuple[int, int, int, int, int]],
+    configs: List[Tuple[int, int, int, int, str, int, int]],
     has_int8_tensor=False,
 ):
     """Heuristic to shrink configs when they are bigger than the input size"""
@@ -35,7 +35,7 @@ def filtered_configs(
     n = max(next_power_of_2(V.graph.sizevars.size_hint(n)), min_block_size)
     k = max(next_power_of_2(V.graph.sizevars.size_hint(k)), min_block_size)
     used = set()
-    for block_m, block_n, block_k, num_stages, num_warps in configs:
+    for block_m, block_n, block_k, group_m, grf_mode, num_stages, num_warps in configs:
         # shrink configs for small sizes
         block_m = max(min(block_m, m), min_block_size)
         block_n = max(min(block_n, n), min_block_size)
@@ -48,6 +48,8 @@ def filtered_configs(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_K=block_k,
+                GROUP_M=group_m,
+                grf_mod=grf_mode,
                 num_stages=num_stages,
                 num_warps=num_warps,
             )
@@ -69,6 +71,14 @@ mm_kernel_configs = [
     {"config": (32, 32, 128, 2, 4), "cond": torch.version.hip is None},
     {"config": (64, 64, 16, 2, 4), "cond": True},
     {"config": (32, 32, 16, 1, 2), "cond": True},
+]
+
+mm_intel_kernel_configs = [
+    {"config": (256, 256, 32, 4, 'large', 2, 32), "cond": True},
+    {"config": (256, 256, 32, 4, 'large', 3, 32), "cond": True},
+    {"config": (256, 128, 32, 4, 'large', 2, 32), "cond": True},
+    {"config": (64, 128, 32, 4, 'large', 2, 32), "cond": True},
+    {"config": (8, 512, 64, 1, 'large', 2, 32), "cond": True},
 ]
 
 int8_mm_kernel_configs = [
@@ -96,6 +106,11 @@ mm_platform_configs = tuple(
     for config in mm_kernel_configs
     if config["cond"]
 )
+mm_intel_platform_configs = tuple(
+    cast(Tuple[int, int, int, int, str, int, int], config["config"])
+    for config in mm_intel_kernel_configs
+    if config["cond"]
+)
 int8_platform_configs = tuple(
     cast(Tuple[int, int, int, int, int], config["config"])
     for config in int8_mm_kernel_configs
@@ -115,7 +130,7 @@ if torch.version.hip:
 
 mm_configs = functools.partial(
     filtered_configs,
-    configs=mm_platform_configs,
+    configs=mm_intel_platform_configs,
 )
 
 int8_mm_configs = functools.partial(

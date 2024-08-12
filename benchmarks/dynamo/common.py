@@ -64,6 +64,7 @@ except ImportError:
     pass
 
 torch._inductor.config.triton.unique_kernel_names = True
+torch._dynamo.config.base_dir=os.environ['TORCHINDUCTOR_CACHE_DIR']
 log = logging.getLogger(__name__)
 
 # We are primarily interested in TF32
